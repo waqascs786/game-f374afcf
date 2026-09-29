@@ -1,0 +1,29 @@
+name: bakery_items
+description: Bakery Items - Trivia Quiz Game
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  firebase_core: ^4.15.0
+  cloud_firestore: ^6.10.0
+  in_app_purchase: ^3.1.13
+  amazon_iap: ^0.2.2
+  google_fonts: ^6.1.0
+  shimmer: ^3.0.0
+
+dependency_overrides:
+  in_app_purchase_storekit: 0.4.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.1
+  flutter_launcher_icons: ^0.14.4
+
+flutter:
+  uses-material-design: true

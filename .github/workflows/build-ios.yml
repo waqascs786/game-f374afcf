@@ -1,0 +1,1027 @@
+name: Build iOS Simulator
+
+on:
+  workflow_dispatch:
+    inputs:
+      game_id:
+        description: 'Game ID'
+        required: true
+      game_name:
+        description: 'Game Name'
+        required: true
+      user_email:
+        description: 'User email for notifications'
+        required: false
+      ios_release:
+        description: 'Build release IPA and upload to TestFlight'
+        required: false
+        default: 'false'
+
+jobs:
+  build-ios:
+    runs-on: macos-26
+    permissions:
+      contents: write
+    outputs:
+      public_key: ${{ steps.upload.outputs.public_key }}
+      ios_url: ${{ steps.release.outputs.ios_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.44.8
+          channel: stable
+
+      - name: Save source files
+        run: |
+          mkdir -p /tmp/saved
+          cp -r lib /tmp/saved/lib
+          cp pubspec.yaml /tmp/saved/pubspec.yaml
+          cp pubspec.lock /tmp/saved/pubspec.lock 2>/dev/null || true
+
+      - name: Create Flutter scaffold in workspace
+        run: |
+          ORG="com.bakery"
+          PROJ="iosg"
+          rm -rf android ios macos linux windows web test
+          flutter create --org "$ORG" --project-name "$PROJ" --platforms ios . 2>&1 | tail -5
+
+      - name: Restore source files
+        run: |
+          rm -rf lib
+          cp -r /tmp/saved/lib .
+          cp /tmp/saved/pubspec.yaml .
+          cp /tmp/saved/pubspec.lock . 2>/dev/null || true
+          echo "=== Verify ==="
+          ls -la lib/main.dart
+          head -3 lib/main.dart
+
+      - name: Create GoogleService-Info.plist
+        run: |
+          BUNDLE_ID="com.bakery.iosg"
+          cat > ios/Runner/GoogleService-Info.plist << PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>API_KEY</key>
+            <string>AIzaSyD4yk_VkMFcAKhMdM4zQMA-e84utQNb2Fs</string>
+            <key>CLIENT_ID</key>
+            <string>311998863107-j04fkrftlradf4j5eo5uor98138e21ke.apps.googleusercontent.com</string>
+            <key>REVERSED_CLIENT_ID</key>
+            <string>moc.tnetnocresuelgoog.sppa.ek12e83189rou5oe5j4fdarltfrkf40j-701368899113</string>
+            <key>GCM_SENDER_ID</key>
+            <string>311998863107</string>
+            <key>PLIST_VERSION</key>
+            <string>1</string>
+            <key>BUNDLE_ID</key>
+            <string>$BUNDLE_ID</string>
+            <key>PROJECT_ID</key>
+            <string>trivianinja-bff5c</string>
+            <key>STORAGE_BUCKET</key>
+            <string>trivianinja-bff5c.firebasestorage.app</string>
+            <key>IS_ADS_ENABLED</key>
+            <false/>
+            <key>IS_ANALYTICS_ENABLED</key>
+            <false/>
+            <key>IS_APPINVITE_ENABLED</key>
+            <true/>
+            <key>IS_GCM_ENABLED</key>
+            <true/>
+            <key>IS_SIGNIN_ENABLED</key>
+            <true/>
+            <key>GOOGLE_APP_ID</key>
+            <string>1:311998863107:ios:a492472970340e432cfb36</string>
+            <key>DATABASE_URL</key>
+            <string>https://trivianinja-bff5c.firebaseio.com</string>
+          </dict>
+          </plist>
+          PLIST
+          echo "GoogleService-Info.plist created for $BUNDLE_ID"
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Set app name
+        run: |
+          python3 -c "
+          import re, os
+          plist = 'ios/Runner/Info.plist'
+          if not os.path.exists(plist):
+              for root, dirs, files in os.walk('ios'):
+                  if 'Info.plist' in files:
+                      plist = os.path.join(root, 'Info.plist')
+                      break
+          with open(plist) as f: c = f.read()
+          game_name = 'Bakery Items'
+          c = re.sub(r'(<key>CFBundleDisplayName</key>\s*<string>)[^<]*(</string>)', r'\1' + game_name + r'\2', c)
+          c = re.sub(r'(<key>CFBundleName</key>\s*<string>)[^<]*(</string>)', r'\1' + game_name + r'\2', c)
+          c = c.replace('<string>Runner</string>', '<string>' + game_name + '</string>')
+          c = c.replace('<string>ios</string>', '<string>' + game_name + '</string>')
+          with open(plist, 'w') as f: f.write(c)
+          print('iOS app name set to: ' + game_name)"
+
+      - name: Set iOS deployment target
+        run: |
+          python3 - << 'DEPTGT'
+          import re
+          p = "ios/Runner.xcodeproj/project.pbxproj"
+          c = open(p).read()
+          c2 = re.sub(r"IPHONEOS_DEPLOYMENT_TARGET = 1[0-4]\.[0-9]+;", "IPHONEOS_DEPLOYMENT_TARGET = 15.0;", c)
+          open(p, "w").write(c2)
+          print("Deployment target set to 15.0")
+          DEPTGT
+
+      - name: Build iOS simulator
+        run: |
+          flutter build ios --debug --simulator
+          cd build/ios/iphonesimulator
+          zip -r app-simulator.zip Runner.app
+
+      - name: Upload iOS build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-simulator
+          path: build/ios/iphonesimulator/app-simulator.zip
+          retention-days: 7
+
+      - name: Create GitHub Release with download
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="ios-${{ github.event.inputs.game_id }}"
+          gh release delete "$TAG" --repo "${{ github.repository }}" -y 2>/dev/null || true
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "iOS Build: ${{ github.event.inputs.game_name }}" \
+            --notes "iOS simulator build for ${{ github.event.inputs.game_name }}" \
+            build/ios/iphonesimulator/app-simulator.zip
+          IOS_URL="https://github.com/${{ github.repository }}/releases/download/$TAG/app-simulator.zip"
+          echo "ios_url=$IOS_URL" >> $GITHUB_OUTPUT
+
+      - name: Upload iOS build to Appetize.io
+        id: upload
+        env:
+          APPETIZE_TOKEN: ${{ secrets.APPETIZE_TOKEN }}
+        run: |
+          SHORT_ID="${{ github.event.inputs.game_id }}"
+          SHORT_ID="${SHORT_ID%%-*}"
+          SHORT_ID="${SHORT_ID:0:20}"
+          RESPONSE=$(curl -s -X POST \
+            -H "X-API-KEY: $APPETIZE_TOKEN" \
+            -F "file=@build/ios/iphonesimulator/app-simulator.zip" \
+            -F "platform=ios" \
+            -F "tags[]=$SHORT_ID" \
+            https://api.appetize.io/v2/builds)
+          echo "iOS response: $RESPONSE"
+          BUILD_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))")
+          echo "public_key=$BUILD_ID" >> $GITHUB_OUTPUT
+
+      - name: Report simulator status - built
+        env:
+          GAME_ID: ${{ github.event.inputs.game_id }}
+          BUILD_WEBHOOK_TOKEN: ${{ secrets.BUILD_WEBHOOK_TOKEN }}
+          REPORT_STATUS: built
+          REPORT_ERROR: ""
+        run: |
+          python3 - << 'REPORTEOF'
+          import json, os, urllib.request
+          payload = {
+              "gameId": os.environ.get("GAME_ID", ""),
+              "token": os.environ.get("BUILD_WEBHOOK_TOKEN", ""),
+              "section": "iosSim",
+              "status": os.environ.get("REPORT_STATUS", ""),
+              "error": os.environ.get("REPORT_ERROR", ""),
+              "urls": {
+                  "testflightUrl": os.environ.get("TESTFLIGHT_URL", ""),
+                  "apkUrl": os.environ.get("APK_URL", ""),
+                  "aabUrl": os.environ.get("AAB_URL", ""),
+              },
+          }
+          if not payload["gameId"] or not payload["token"]:
+              print("missing gameId/token, skipping status report"); raise SystemExit(0)
+          req = urllib.request.Request(
+              "https://us-central1-trivianinja-bff5c.cloudfunctions.net/updateBuildStatus",
+              data=json.dumps(payload).encode(),
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          try:
+              print(urllib.request.urlopen(req, timeout=30).read().decode())
+          except Exception as e:
+              print("status report failed (non-fatal):", e)
+          REPORTEOF
+      - name: Report simulator status - failed
+        if: failure()
+        env:
+          GAME_ID: ${{ github.event.inputs.game_id }}
+          BUILD_WEBHOOK_TOKEN: ${{ secrets.BUILD_WEBHOOK_TOKEN }}
+          REPORT_STATUS: failed
+          REPORT_ERROR: "iOS simulator build failed - check workflow logs"
+        run: |
+          python3 - << 'REPORTEOF'
+          import json, os, urllib.request
+          payload = {
+              "gameId": os.environ.get("GAME_ID", ""),
+              "token": os.environ.get("BUILD_WEBHOOK_TOKEN", ""),
+              "section": "iosSim",
+              "status": os.environ.get("REPORT_STATUS", ""),
+              "error": os.environ.get("REPORT_ERROR", ""),
+              "urls": {
+                  "testflightUrl": os.environ.get("TESTFLIGHT_URL", ""),
+                  "apkUrl": os.environ.get("APK_URL", ""),
+                  "aabUrl": os.environ.get("AAB_URL", ""),
+              },
+          }
+          if not payload["gameId"] or not payload["token"]:
+              print("missing gameId/token, skipping status report"); raise SystemExit(0)
+          req = urllib.request.Request(
+              "https://us-central1-trivianinja-bff5c.cloudfunctions.net/updateBuildStatus",
+              data=json.dumps(payload).encode(),
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          try:
+              print(urllib.request.urlopen(req, timeout=30).read().decode())
+          except Exception as e:
+              print("status report failed (non-fatal):", e)
+          REPORTEOF
+
+  build-ios-release:
+    if: github.event.inputs.ios_release == 'true'
+    runs-on: macos-26
+    permissions:
+      contents: write
+    outputs:
+      ipa_url: ${{ steps.ipa_release.outputs.ipa_url }}
+    env:
+      IOS_BUNDLE_ID: "com.bakery.iosg"
+      APP_DISPLAY_NAME: "Bakery Items"
+      ASC_TEAM_ID: ${{ secrets.ASC_TEAM_ID }}
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_AUTH_KEY: ${{ secrets.ASC_AUTH_KEY }}
+      ASC_VERSION: ${{ secrets.ASC_VERSION }}
+      APP_VERSION: ${{ secrets.APP_VERSION }}
+      APP_ICON_URL: ${{ secrets.APP_ICON_URL }}
+      IOS_DIST_P12_B64: ${{ secrets.IOS_DIST_P12_B64 }}
+      IOS_DIST_CERT_ID: ${{ secrets.IOS_DIST_CERT_ID }}
+      GH_PAT: ${{ secrets.GH_PAT }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.44.8
+          channel: stable
+
+      - name: Save source files
+        run: |
+          mkdir -p /tmp/saved
+          cp -r lib /tmp/saved/lib
+          cp pubspec.yaml /tmp/saved/pubspec.yaml
+          cp pubspec.lock /tmp/saved/pubspec.lock 2>/dev/null || true
+
+      - name: Create Flutter scaffold in workspace
+        run: |
+          ORG="com.bakery"
+          PROJ="iosg"
+          rm -rf android ios macos linux windows web test
+          flutter create --org "$ORG" --project-name "$PROJ" --platforms ios . 2>&1 | tail -5
+
+      - name: Restore source files
+        run: |
+          rm -rf lib
+          cp -r /tmp/saved/lib .
+          cp /tmp/saved/pubspec.yaml .
+          cp /tmp/saved/pubspec.lock . 2>/dev/null || true
+          echo "=== Verify ==="
+          ls -la lib/main.dart
+          head -3 lib/main.dart
+
+      - name: Create GoogleService-Info.plist
+        run: |
+          BUNDLE_ID="com.bakery.iosg"
+          cat > ios/Runner/GoogleService-Info.plist << PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>API_KEY</key>
+            <string>AIzaSyD4yk_VkMFcAKhMdM4zQMA-e84utQNb2Fs</string>
+            <key>CLIENT_ID</key>
+            <string>311998863107-j04fkrftlradf4j5eo5uor98138e21ke.apps.googleusercontent.com</string>
+            <key>REVERSED_CLIENT_ID</key>
+            <string>moc.tnetnocresuelgoog.sppa.ek12e83189rou5oe5j4fdarltfrkf40j-701368899113</string>
+            <key>GCM_SENDER_ID</key>
+            <string>311998863107</string>
+            <key>PLIST_VERSION</key>
+            <string>1</string>
+            <key>BUNDLE_ID</key>
+            <string>$BUNDLE_ID</string>
+            <key>PROJECT_ID</key>
+            <string>trivianinja-bff5c</string>
+            <key>STORAGE_BUCKET</key>
+            <string>trivianinja-bff5c.firebasestorage.app</string>
+            <key>IS_ADS_ENABLED</key>
+            <false/>
+            <key>IS_ANALYTICS_ENABLED</key>
+            <false/>
+            <key>IS_APPINVITE_ENABLED</key>
+            <true/>
+            <key>IS_GCM_ENABLED</key>
+            <true/>
+            <key>IS_SIGNIN_ENABLED</key>
+            <true/>
+            <key>GOOGLE_APP_ID</key>
+            <string>1:311998863107:ios:a492472970340e432cfb36</string>
+            <key>DATABASE_URL</key>
+            <string>https://trivianinja-bff5c.firebaseio.com</string>
+          </dict>
+          </plist>
+          PLIST
+          echo "GoogleService-Info.plist created for $BUNDLE_ID"
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Set app name
+        run: |
+          python3 -c "
+          import re, os
+          plist = 'ios/Runner/Info.plist'
+          if not os.path.exists(plist):
+              for root, dirs, files in os.walk('ios'):
+                  if 'Info.plist' in files:
+                      plist = os.path.join(root, 'Info.plist')
+                      break
+          with open(plist) as f: c = f.read()
+          game_name = 'Bakery Items'
+          c = re.sub(r'(<key>CFBundleDisplayName</key>\s*<string>)[^<]*(</string>)', r'\1' + game_name + r'\2', c)
+          c = re.sub(r'(<key>CFBundleName</key>\s*<string>)[^<]*(</string>)', r'\1' + game_name + r'\2', c)
+          c = c.replace('<string>Runner</string>', '<string>' + game_name + '</string>')
+          c = c.replace('<string>ios</string>', '<string>' + game_name + '</string>')
+          with open(plist, 'w') as f: f.write(c)
+          print('iOS app name set to: ' + game_name)"
+
+      - name: Download app icon
+        run: |
+          if [ -n "$APP_ICON_URL" ]; then
+            mkdir -p assets/icon
+            if curl -fsSL "$APP_ICON_URL" -o assets/icon/app_icon.png; then
+              echo "App icon downloaded"
+            else
+              echo "Icon download failed - using default Flutter icon"
+              rm -f assets/icon/app_icon.png
+            fi
+          else
+            echo "No APP_ICON_URL secret - using default Flutter icon"
+          fi
+
+      - name: Crop icon to square (if needed)
+        run: |
+          if [ -f assets/icon/app_icon.png ]; then
+            w=$(sips -g pixelWidth assets/icon/app_icon.png 2>/dev/null | awk '/pixelWidth/ {print $2}')
+            h=$(sips -g pixelHeight assets/icon/app_icon.png 2>/dev/null | awk '/pixelHeight/ {print $2}')
+            if [[ "$w" =~ ^[0-9]+$ && "$h" =~ ^[0-9]+$ && "$w" != "$h" ]]; then
+              m=$w
+              if [ "$h" -lt "$w" ]; then m=$h; fi
+              if sips -c "$m" "$m" assets/icon/app_icon.png >/dev/null 2>&1; then
+                echo "Cropped non-square icon to ${m}x${m}"
+              else
+                echo "Icon crop failed - continuing with original"
+              fi
+            else
+              echo "Icon already square (${w}x${h})"
+            fi
+          fi
+
+      - name: Generate native launcher icons
+        run: |
+          if [ -f assets/icon/app_icon.png ] && [ -f flutter_icons_ios.yaml ]; then
+            flutter pub get >/dev/null 2>&1 || true
+            dart run flutter_launcher_icons -f flutter_icons_ios.yaml || echo "WARNING: launcher icon generation failed, continuing with default icons"
+          else
+            echo "Skipping launcher icon generation"
+          fi
+
+      - name: Set app version
+        run: |
+          plutil -replace CFBundleShortVersionString -string "${APP_VERSION:-${ASC_VERSION:-1.0.0}}" ios/Runner/Info.plist
+          plutil -replace CFBundleVersion -string "$(date +%s)" ios/Runner/Info.plist
+          plutil -p ios/Runner/Info.plist | grep -E "CFBundleShortVersionString|CFBundleVersion" || true
+
+      - name: Report release status - building
+        env:
+          GAME_ID: ${{ github.event.inputs.game_id }}
+          BUILD_WEBHOOK_TOKEN: ${{ secrets.BUILD_WEBHOOK_TOKEN }}
+          REPORT_STATUS: building
+          REPORT_ERROR: ""
+        run: |
+          python3 - << 'REPORTEOF'
+          import json, os, urllib.request
+          payload = {
+              "gameId": os.environ.get("GAME_ID", ""),
+              "token": os.environ.get("BUILD_WEBHOOK_TOKEN", ""),
+              "section": "iosRelease",
+              "status": os.environ.get("REPORT_STATUS", ""),
+              "error": os.environ.get("REPORT_ERROR", ""),
+              "urls": {
+                  "testflightUrl": os.environ.get("TESTFLIGHT_URL", ""),
+                  "apkUrl": os.environ.get("APK_URL", ""),
+                  "aabUrl": os.environ.get("AAB_URL", ""),
+              },
+          }
+          if not payload["gameId"] or not payload["token"]:
+              print("missing gameId/token, skipping status report"); raise SystemExit(0)
+          req = urllib.request.Request(
+              "https://us-central1-trivianinja-bff5c.cloudfunctions.net/updateBuildStatus",
+              data=json.dumps(payload).encode(),
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          try:
+              print(urllib.request.urlopen(req, timeout=30).read().decode())
+          except Exception as e:
+              print("status report failed (non-fatal):", e)
+          REPORTEOF
+
+      - name: Configure signing via App Store Connect API
+        id: signing
+        run: |
+          python3 -m pip install --user --quiet cryptography 2>&1 | tail -1 || true
+          python3 - << 'PYEOF'
+          import os, sys, re, json, time, base64, subprocess, shutil
+          import urllib.request, urllib.error
+
+          TEAM = os.environ["ASC_TEAM_ID"]
+          KEY_ID = os.environ["ASC_KEY_ID"]
+          ISSUER = os.environ["ASC_ISSUER_ID"]
+          AUTH_KEY = os.environ["ASC_AUTH_KEY"]
+          BUNDLE = os.environ["IOS_BUNDLE_ID"]
+          APP_NAME = os.environ.get("APP_DISPLAY_NAME", "Trivia Game")
+          OUT = os.environ.get("GITHUB_OUTPUT", "/dev/null")
+
+          for v in (TEAM, KEY_ID, ISSUER, AUTH_KEY):
+              if not v:
+                  print("::error::Missing ASC credentials secret"); sys.exit(1)
+
+          WORK = os.path.expanduser("~/asc")
+          os.makedirs(WORK, exist_ok=True)
+          p8path = os.path.join(WORK, "AuthKey_%s.p8" % KEY_ID)
+          with open(p8path, "w") as f:
+              f.write(AUTH_KEY)
+          os.chmod(p8path, 0o600)
+
+          try:
+              from cryptography.hazmat.primitives import serialization, hashes
+              from cryptography.hazmat.primitives.asymmetric import ec, utils
+          except ImportError:
+              subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", "--quiet", "cryptography"])
+              from cryptography.hazmat.primitives import serialization, hashes
+              from cryptography.hazmat.primitives.asymmetric import ec, utils
+
+          key = serialization.load_pem_private_key(AUTH_KEY.encode(), password=None)
+          def b64u(b):
+              return base64.urlsafe_b64encode(b).rstrip(b"=")
+          def make_jwt():
+              header = {"alg": "ES256", "kid": KEY_ID, "typ": "JWT"}
+              now = int(time.time())
+              payload = {"iss": ISSUER, "iat": now, "exp": now + 1200, "aud": "appstoreconnect-v1"}
+              signing_input = b64u(json.dumps(header, separators=(",", ":")).encode()) + b"." + b64u(json.dumps(payload, separators=(",", ":")).encode())
+              der = key.sign(signing_input, ec.ECDSA(hashes.SHA256()))
+              r, s = utils.decode_dss_signature(der)
+              sig = r.to_bytes(32, "big") + s.to_bytes(32, "big")
+              return (signing_input + b"." + b64u(sig)).decode()
+          JWT = make_jwt()
+
+          def api(method, path, body=None, raw=False, soft=False):
+              data = json.dumps(body).encode() if body is not None else None
+              req = urllib.request.Request(
+                  "https://api.appstoreconnect.apple.com" + path,
+                  data=data, method=method,
+                  headers={"Authorization": "Bearer " + JWT, "Content-Type": "application/json"},
+              )
+              try:
+                  resp = urllib.request.urlopen(req, timeout=60)
+                  b = resp.read()
+                  return b if raw else json.loads(b.decode())
+              except urllib.error.HTTPError as e:
+                  detail = e.read().decode(errors="replace")[:800]
+                  if soft:
+                      print("ASC API (ignored error) %s %s -> %s: %s" % (method, path, e.code, detail))
+                      return None
+                  print("::error::ASC API %s %s -> %s: %s" % (method, path, e.code, detail))
+                  raise SystemExit(1)
+
+          # 1. Register bundle ID (reuse if already registered; ASC filter can lag)
+          def find_bundle():
+              r = api("GET", "/v1/bundleIds?filter[identifier]=" + BUNDLE)
+              return (r or {}).get("data") or []
+          data = find_bundle()
+          if not data:
+              print("Registering bundle ID with Apple...")
+              api("POST", "/v1/bundleIds", {"data": {"type": "bundleIds", "attributes": {"identifier": BUNDLE, "name": (APP_NAME + " Bundle")[:30], "platform": "IOS", "seedId": TEAM}}}, soft=True)
+              for _attempt in range(4):
+                  time.sleep(3)
+                  data = find_bundle()
+                  if data:
+                      break
+              if not data:
+                  print("::error::Bundle ID registration failed (identifier: %s)" % BUNDLE); sys.exit(1)
+          bundle_rid = data[0]["id"]
+          print("Bundle ID resource:", bundle_rid)
+
+          # 2. Distribution certificate: reuse saved p12, else create via API
+          P12 = os.path.join(WORK, "dist.p12")
+          P12_PASS = "Tr1viaN1nja!"
+          cert_id = os.environ.get("IOS_DIST_CERT_ID", "") or ""
+          created_cert = False
+          p12_b64 = os.environ.get("IOS_DIST_P12_B64", "") or ""
+          if p12_b64:
+              with open(P12, "wb") as f:
+                  f.write(base64.b64decode(p12_b64))
+              print("Reusing saved distribution certificate")
+          else:
+              print("Creating distribution certificate via App Store Connect API...")
+              csr_path = os.path.join(WORK, "dist.csr")
+              key_path = os.path.join(WORK, "dist.key")
+              subprocess.check_call(["openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes",
+                                      "-keyout", key_path, "-out", csr_path,
+                                      "-subj", "/CN=TriviaNinja Distribution"])
+              with open(csr_path) as f:
+                  csr = f.read()
+              cert = api("POST", "/v1/certificates", {"data": {"type": "certificates", "attributes": {"csrContent": csr, "certificateType": "IOS_DISTRIBUTION"}}}, soft=True)
+              if not cert:
+                  print("::error::Could not create distribution certificate (see ASC error above; if the account has 3 active certificates, revoke one at developer.apple.com/account)"); sys.exit(1)
+              cert_id = cert["data"]["id"]
+              det = api("GET", "/v1/certificates/" + cert_id)
+              cer_path = os.path.join(WORK, "dist.cer")
+              with open(cer_path, "wb") as f:
+                  f.write(base64.b64decode(det["data"]["attributes"]["certificateContent"]))
+              pem_path = os.path.join(WORK, "dist.pem")
+              subprocess.check_call(["openssl", "x509", "-inform", "der", "-in", cer_path, "-out", pem_path])
+              subprocess.check_call(["openssl", "pkcs12", "-export", "-out", P12,
+                                      "-inkey", key_path, "-in", pem_path,
+                                      "-passout", "pass:" + P12_PASS])
+              created_cert = True
+              print("Certificate created:", cert_id)
+          if not cert_id:
+              print("::error::No distribution certificate ID (IOS_DIST_CERT_ID missing and not created)"); sys.exit(1)
+
+          # 3. Import certificate into a dedicated keychain (must end up in the user search list)
+          KC_PASS = "buildkc"
+          subprocess.run(["security", "create-keychain", "-p", KC_PASS, "build.keychain"], check=False, capture_output=True)
+          # default timeout is 300s which relocks the keychain mid-archive and hangs codesign
+          subprocess.run(["security", "set-keychain-settings", "-lut", "21600", "build.keychain"], check=False, capture_output=True)
+          subprocess.run(["security", "unlock-keychain", "-p", KC_PASS, "build.keychain"], check=True, capture_output=True)
+          kc_candidates = [os.path.expanduser(p) for p in ("~/Library/Keychains/build.keychain", "~/Library/Keychains/build.keychain-db", "~/Library/Keychains/build.keychain.keychain-db") if os.path.exists(os.path.expanduser(p))]
+          kc_path = kc_candidates[0] if kc_candidates else "build.keychain"
+          cur = subprocess.run(["security", "list-keychains", "-d", "user"], capture_output=True, text=True).stdout
+          existing = re.findall(r'"([^"]+)"', cur)
+          ordered = [kc_path] + [k for k in existing if "build.keychain" not in k]
+          listed = subprocess.run(["security", "list-keychains", "-d", "user", "-s"] + ordered, capture_output=True, text=True)
+          if listed.returncode != 0:
+              print("list-keychains warning:", (listed.stderr or "").strip())
+              subprocess.run(["security", "list-keychains", "-d", "user", "-s"] + ordered, check=False, capture_output=True)
+          subprocess.run(["security", "import", P12, "-k", kc_path, "-P", P12_PASS,
+                          "-T", "/usr/bin/codesign", "-T", "/usr/bin/security"], check=True, capture_output=True)
+          subprocess.run(["security", "set-key-partition-list", "-S", "apple-tool:,apple:,codesign:",
+                          "-s", "-k", KC_PASS, kc_path], check=True, capture_output=True)
+          print("Certificate imported into", kc_path)
+          # Apple WWDR intermediates must be present or the identity counts as untrusted
+          for ca_url in ("https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer",
+                         "https://www.apple.com/certificateauthority/AppleWWDRCAG4.cer"):
+              try:
+                  ca_data = urllib.request.urlopen(ca_url, timeout=30).read()
+                  ca_path = os.path.join(WORK, os.path.basename(ca_url))
+                  with open(ca_path, "wb") as f:
+                      f.write(ca_data)
+                  r = subprocess.run(["security", "import", ca_path, "-k", kc_path], capture_output=True, text=True)
+                  print("CA import %s: %s" % (os.path.basename(ca_url), (r.stdout + r.stderr).strip()))
+              except Exception as e:
+                  print("CA import skipped (%s): %s" % (ca_url, e))
+          print("Keychain search list:", subprocess.run(["security", "list-keychains", "-d", "user"], capture_output=True, text=True).stdout.replace(chr(10), " "))
+          id_out = subprocess.run(["security", "find-identity", "-v", "-p", "codesigning"], capture_output=True, text=True).stdout
+          print("Identities:\n" + id_out)
+          identities = re.findall(r'"([^"]+)"', id_out)
+          if not identities:
+              print("::warning::No valid signing identities visible to find-identity")
+          DIST_IDENTITY = next((i for i in identities if "Distribution" in i), "Apple Distribution")
+          print("Using signing identity:", DIST_IDENTITY)
+
+          # 4. Provisioning profile (name tied to cert so cert rotation forces a new profile)
+          PROFILE_NAME = "TN-" + re.sub(r"[^A-Za-z0-9]", "", cert_id)[:24]
+          r = api("GET", "/v1/profiles?filter[name]=" + PROFILE_NAME + "&filter[profileType]=IOS_APP_STORE&limit=3")
+          profiles = r.get("data") or []
+          if profiles:
+              profile_rid = profiles[0]["id"]
+              print("Reusing provisioning profile:", PROFILE_NAME)
+          else:
+              print("Creating provisioning profile...")
+              prof = api("POST", "/v1/profiles", {"data": {
+                  "type": "profiles",
+                  "attributes": {"name": PROFILE_NAME, "profileType": "IOS_APP_STORE"},
+                  "relationships": {
+                      "bundleId": {"data": {"id": bundle_rid, "type": "bundleIds"}},
+                      "certificates": {"data": [{"id": cert_id, "type": "certificates"}]},
+                  },
+              }}, soft=True)
+              if prof:
+                  profile_rid = prof["data"]["id"]
+                  print("Provisioning profile created:", PROFILE_NAME)
+              else:
+                  r = api("GET", "/v1/profiles?filter[name]=" + PROFILE_NAME + "&filter[profileType]=IOS_APP_STORE&limit=3")
+                  profiles = (r or {}).get("data") or []
+                  if not profiles:
+                      print("::error::Provisioning profile creation failed"); sys.exit(1)
+                  profile_rid = profiles[0]["id"]
+                  print("Reusing provisioning profile:", PROFILE_NAME)
+          pattrs = api("GET", "/v1/profiles/" + profile_rid)["data"]["attributes"]
+          profile_uuid = pattrs["uuid"]
+          prof_bytes = base64.b64decode(pattrs["profileContent"])
+          if not profile_uuid or not prof_bytes:
+              print("::error::Could not read provisioning profile content"); sys.exit(1)
+          prof_dir = os.path.expanduser("~/Library/MobileDevice/Provisioning Profiles")
+          os.makedirs(prof_dir, exist_ok=True)
+          with open(os.path.join(prof_dir, profile_uuid + ".mobileprovision"), "wb") as f:
+              f.write(prof_bytes)
+          prof_dir2 = os.path.expanduser("~/Library/Developer/Xcode/UserData/Provisioning Profiles")
+          os.makedirs(prof_dir2, exist_ok=True)
+          with open(os.path.join(prof_dir2, profile_uuid + ".mobileprovision"), "wb") as f:
+              f.write(prof_bytes)
+          print("Profile installed:", profile_uuid, "in both profile directories")
+
+          # 5. App Store Connect app record (auto-create if missing, Admin key required)
+          testflight_url = ""
+          r = api("GET", "/v1/apps?filter[bundleId]=" + BUNDLE)
+          apps = r.get("data") or []
+          if apps:
+              testflight_url = "https://appstoreconnect.apple.com/apps/" + apps[0]["id"] + "/testflight/ios"
+          else:
+              print("App record not found, attempting auto-create...")
+              app_label = re.sub(r"[^A-Za-z0-9 ]", "", APP_NAME).strip()[:30] or "Trivia Game"
+              sku = "tn" + re.sub(r"[^a-z0-9]", "", BUNDLE.lower())[:22]
+              try:
+                  api("POST", "/v1/apps", {"data": {
+                      "type": "apps",
+                      "attributes": {"bundleId": BUNDLE, "name": app_label, "sku": sku, "primaryLocale": "en-US"},
+                  }}, soft=True)
+                  r = api("GET", "/v1/apps?filter[bundleId]=" + BUNDLE)
+                  apps = r.get("data") or []
+                  if apps:
+                      testflight_url = "https://appstoreconnect.apple.com/apps/" + apps[0]["id"] + "/testflight/ios"
+                      print("App record created")
+                  else:
+                      print("::warning::Could not auto-create app record. Create the app manually in App Store Connect (bundle ID: %s), then re-publish." % BUNDLE)
+              except SystemExit:
+                  print("::warning::Could not auto-create app record. Create the app manually in App Store Connect (bundle ID: %s), then re-publish." % BUNDLE)
+              except Exception as e:
+                  print("::warning::App record auto-create failed: %s. Create the app manually in App Store Connect, then re-publish." % e)
+
+          # 6. exportOptions.plist (manual signing, method app-store-connect)
+          export_opts = os.path.join(WORK, "ExportOptions.plist")
+          with open(export_opts, "w") as f:
+              f.write('''<?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store-connect</string>
+            <key>teamID</key>
+            <string>%s</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>signingCertificate</key>
+            <string>%s</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>%s</key>
+              <string>%s</string>
+            </dict>
+            <key>uploadSymbols</key>
+            <true/>
+            <key>manageAppVersionAndBuildNumber</key>
+            <false/>
+          </dict>
+          </plist>
+          ''' % (TEAM, DIST_IDENTITY, BUNDLE, PROFILE_NAME))
+          shutil.copy(export_opts, "ios/ExportOptions.plist")
+
+          # 7. Patch the Runner target build configurations for manual signing
+          pbx = "ios/Runner.xcodeproj/project.pbxproj"
+          with open(pbx) as f:
+              c = f.read()
+          tm = re.search(r"([0-9A-F]{24}) /\* Runner \*/ = \{\n\t\t\tisa = PBXNativeTarget;(.*?)\n\t\t\};", c, re.S)
+          if not tm:
+              print("::error::Could not locate Runner native target in pbxproj"); sys.exit(1)
+          lm = None
+          list_id = None
+          for lid in re.findall(r"buildConfigurationList = ([0-9A-F]{24})", tm.group(2)):
+              list_id = lid
+          lm = re.search(re.escape(list_id) + r" /\* Build configuration list[^*]*\*/ = \{\n\t\t\tisa = XCConfigurationList;\n(?:\t\t\tdefaultConfigurationIsVisible = \d+;\n)?\t\t\tbuildConfigurations = \((.*?)\);", c, re.S)
+          if not lm:
+              print("::error::Could not locate Runner build configuration list (%s)" % list_id); sys.exit(1)
+          cfg_ids = re.findall(r"([0-9A-F]{24}) /\*", lm.group(1))
+          print("Runner configuration IDs:", cfg_ids)
+          for cid in cfg_ids:
+              cm = re.search(
+                  re.escape(cid) + r" /\* \w+ \*/ = \{\n\t\t\tisa = XCBuildConfiguration;\n(\t\t\tbaseConfigurationReference = [^;]+;\n)?\t\t\tbuildSettings = \{(.*?)\n\t\t\t\};",
+                  c,
+                  re.S,
+              )
+              if not cm:
+                  print("::error::Could not parse Runner build config %s" % cid); sys.exit(1)
+              body = cm.group(2)
+              nb = re.sub(r'[ \t]*"CODE_SIGN_IDENTITY(\[sdk=[^\]]+\])?" = "[^"]*";\n', "", body)
+              nb = re.sub(r"[ \t]*CODE_SIGN_STYLE = \w+;\n", "", nb)
+              nb = re.sub(r"[ \t]*DEVELOPMENT_TEAM = [^;]*;\n", "", nb)
+              nb = re.sub(r"[ \t]*PROVISIONING_PROFILE_SPECIFIER = [^;]*;\n", "", nb)
+              nb += (
+                  "\n\t\t\t\tCODE_SIGN_STYLE = Manual;"
+                  "\n\t\t\t\tDEVELOPMENT_TEAM = " + TEAM + ";"
+                  "\n\t\t\t\tPROVISIONING_PROFILE_SPECIFIER = " + PROFILE_NAME + ";"
+                  "\n\t\t\t\t\"CODE_SIGN_IDENTITY[sdk=iphoneos*]\" = \"" + DIST_IDENTITY + "\";"
+                  "\n\t\t\t\tCODE_SIGN_IDENTITY = \"" + DIST_IDENTITY + "\";"
+              )
+              c = c.replace(cm.group(0), cm.group(0).replace(body, nb))
+          # project-level fallback identities
+          c = re.sub(r'"CODE_SIGN_IDENTITY\[sdk=[^\]]+\]" = "[^"]*";', '"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "' + DIST_IDENTITY + '";', c)
+          c = c.replace('CODE_SIGN_IDENTITY = "iPhone Developer";', 'CODE_SIGN_IDENTITY = "' + DIST_IDENTITY + '";')
+          c = c.replace('CODE_SIGN_IDENTITY = "Apple Development";', 'CODE_SIGN_IDENTITY = "' + DIST_IDENTITY + '";')
+          with open(pbx, "w") as f:
+              f.write(c)
+          # verify every patched config has DEVELOPMENT_TEAM inside buildSettings braces
+          inside = len(re.findall(r"buildSettings = \{[^}]*DEVELOPMENT_TEAM = " + re.escape(TEAM), c, re.S))
+          if inside < 3:
+              print("::error::DEVELOPMENT_TEAM not found inside buildSettings for all configs (%d/3)" % inside); sys.exit(1)
+          # FirebaseIOSSDK 12 requires iOS 15+; App Store Connect accepts 13-27.2
+          c = re.sub(r"IPHONEOS_DEPLOYMENT_TARGET = 1[0-4]\.[0-9]+;", "IPHONEOS_DEPLOYMENT_TARGET = 15.0;", c)
+          with open(pbx, "w") as f:
+              f.write(c)
+          if os.path.exists("ios/Podfile"):
+              with open("ios/Podfile") as f:
+                  pfc = f.read()
+              pfc2 = re.sub(r"platform :ios, '1[0-4]\.[0-9]+'", "platform :ios, '15.0'", pfc)
+              if pfc2 != pfc:
+                  with open("ios/Podfile", "w") as f:
+                      f.write(pfc2)
+                  print("Podfile iOS platform bumped to 15.0")
+          print("Xcode project patched for manual signing. Sign settings now:")
+          for line in c.splitlines():
+              if "CODE_SIGN_STYLE" in line or "DEVELOPMENT_TEAM" in line or "PROVISIONING_PROFILE_SPECIFIER" in line or "CODE_SIGN_IDENTITY" in line:
+                  print("   " + line.strip())
+
+          def out(k, v):
+              with open(OUT, "a") as f:
+                  f.write("%s=%s\n" % (k, v))
+          if created_cert:
+              out("cert_created", "true")
+          out("cert_id", cert_id)
+          out("profile_name", PROFILE_NAME)
+          out("testflight_url", testflight_url)
+          print("Signing configuration complete")
+          PYEOF
+
+      - name: Save new certificate to repo secrets
+        if: steps.signing.outputs.cert_created == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::GH_PAT not set - certificate not saved (next build will create a new one)"
+            exit 0
+          fi
+          P12_B64=$(base64 -i ~/asc/dist.p12 | tr -d "\n")
+          gh secret set IOS_DIST_P12_B64 --repo "${{ github.repository }}" --body "$P12_B64"
+          gh secret set IOS_DIST_CERT_ID --repo "${{ github.repository }}" --body "${{ steps.signing.outputs.cert_id }}"
+
+      - name: Probe Xcode build settings
+        run: |
+          set +e
+          echo "=== xcodebuild -list ==="
+          xcrun xcodebuild -list -project ios/Runner.xcodeproj 2>&1 | tail -15
+          echo "=== showBuildSettings (key values) ==="
+          xcrun xcodebuild -project ios/Runner.xcodeproj -scheme Runner -configuration Release -destination "generic/platform=iOS" -showBuildSettings > /tmp/sbs.log 2>&1
+          echo "sbs exit=$?"
+          grep -E "^    (DEVELOPMENT_TEAM|CODE_SIGN_STYLE|PROVISIONING_PROFILE_SPECIFIER|CODE_SIGN_IDENTITY|PRODUCT_BUNDLE_IDENTIFIER|IPHONEOS_DEPLOYMENT_TARGET) = " /tmp/sbs.log | sort -u
+          echo "=== xcodebuild errors (if any) ==="
+          grep -iE "error" /tmp/sbs.log | head -10
+          true
+
+      - name: Build release IPA
+        run: |
+          set -o pipefail
+          security unlock-keychain -p buildkc build.keychain 2>/dev/null || security unlock-keychain -p buildkc ~/Library/Keychains/build.keychain-db 2>/dev/null || true
+          flutter build ipa --release --export-options-plist ~/asc/ExportOptions.plist 2>&1 | tee /tmp/build.log || {
+            echo "REPORT_ERROR=$(grep -m1 -E 'error:|Error|FAILURE|No valid code signing|No development certificates|requires a development team' /tmp/build.log | head -c 400)" >> "$GITHUB_ENV"
+            exit 1
+          }
+          ls -la build/ios/ipa/*.ipa
+
+      - name: Create GitHub Release with IPA
+        id: ipa_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          IPA=$(ls build/ios/ipa/*.ipa | head -1)
+          cp "$IPA" /tmp/app-release.ipa
+          TAG="ios-release-${{ github.event.inputs.game_id }}"
+          gh release delete "$TAG" --repo "${{ github.repository }}" -y 2>/dev/null || true
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "iOS Release IPA: ${{ github.event.inputs.game_name }}" \
+            --notes "Release IPA for ${{ github.event.inputs.game_name }}" \
+            /tmp/app-release.ipa
+          IPA_URL="https://github.com/${{ github.repository }}/releases/download/$TAG/app-release.ipa"
+          echo "ipa_url=$IPA_URL" >> $GITHUB_OUTPUT
+          echo "IPA release: $IPA_URL"
+
+      - name: Upload to TestFlight
+        run: |
+          set -o pipefail
+          mkdir -p fastlane
+          cat > fastlane/Fastfile << 'FASTLANE_EOF'
+          default_platform(:ios)
+
+          platform :ios do
+            lane :upload do
+              api_key = app_store_connect_api_key(
+                key_id: ENV["ASC_KEY_ID"],
+                issuer_id: ENV["ASC_ISSUER_ID"],
+                key_content: ENV["ASC_AUTH_KEY"],
+                in_house: false
+              )
+              pilot(
+                api_key: api_key,
+                ipa: ENV["IPA_PATH"],
+                changelog: "Automated build",
+                skip_waiting_for_build_processing: true,
+                notify_external_testers: false
+              )
+            end
+          end
+          FASTLANE_EOF
+          gem list -i -N fastlane >/dev/null 2>&1 || gem install fastlane --no-document 2>&1 | tail -2
+          export IPA_PATH=$(ls build/ios/ipa/*.ipa | head -1)
+          fastlane ios upload 2>&1 | tee /tmp/tf.log || {
+            echo "REPORT_ERROR=$(grep -m1 -iE 'error|could not find|invalid|missing' /tmp/tf.log | head -c 400)" >> "$GITHUB_ENV"
+            exit 1
+          }
+          echo "TESTFLIGHT_URL=${{ steps.signing.outputs.testflight_url }}" >> "$GITHUB_ENV"
+
+      - name: Report release status - uploaded
+        env:
+          GAME_ID: ${{ github.event.inputs.game_id }}
+          BUILD_WEBHOOK_TOKEN: ${{ secrets.BUILD_WEBHOOK_TOKEN }}
+          REPORT_STATUS: uploaded
+          REPORT_ERROR: ""
+        run: |
+          python3 - << 'REPORTEOF'
+          import json, os, urllib.request
+          payload = {
+              "gameId": os.environ.get("GAME_ID", ""),
+              "token": os.environ.get("BUILD_WEBHOOK_TOKEN", ""),
+              "section": "iosRelease",
+              "status": os.environ.get("REPORT_STATUS", ""),
+              "error": os.environ.get("REPORT_ERROR", ""),
+              "urls": {
+                  "testflightUrl": os.environ.get("TESTFLIGHT_URL", ""),
+                  "apkUrl": os.environ.get("APK_URL", ""),
+                  "aabUrl": os.environ.get("AAB_URL", ""),
+              },
+          }
+          if not payload["gameId"] or not payload["token"]:
+              print("missing gameId/token, skipping status report"); raise SystemExit(0)
+          req = urllib.request.Request(
+              "https://us-central1-trivianinja-bff5c.cloudfunctions.net/updateBuildStatus",
+              data=json.dumps(payload).encode(),
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          try:
+              print(urllib.request.urlopen(req, timeout=30).read().decode())
+          except Exception as e:
+              print("status report failed (non-fatal):", e)
+          REPORTEOF
+      - name: Report release status - failed
+        if: failure()
+        env:
+          GAME_ID: ${{ github.event.inputs.game_id }}
+          BUILD_WEBHOOK_TOKEN: ${{ secrets.BUILD_WEBHOOK_TOKEN }}
+          REPORT_STATUS: failed
+          REPORT_ERROR: ${{ env.REPORT_ERROR || 'iOS release build or TestFlight upload failed - check workflow logs' }}
+        run: |
+          python3 - << 'REPORTEOF'
+          import json, os, urllib.request
+          payload = {
+              "gameId": os.environ.get("GAME_ID", ""),
+              "token": os.environ.get("BUILD_WEBHOOK_TOKEN", ""),
+              "section": "iosRelease",
+              "status": os.environ.get("REPORT_STATUS", ""),
+              "error": os.environ.get("REPORT_ERROR", ""),
+              "urls": {
+                  "testflightUrl": os.environ.get("TESTFLIGHT_URL", ""),
+                  "apkUrl": os.environ.get("APK_URL", ""),
+                  "aabUrl": os.environ.get("AAB_URL", ""),
+              },
+          }
+          if not payload["gameId"] or not payload["token"]:
+              print("missing gameId/token, skipping status report"); raise SystemExit(0)
+          req = urllib.request.Request(
+              "https://us-central1-trivianinja-bff5c.cloudfunctions.net/updateBuildStatus",
+              data=json.dumps(payload).encode(),
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          try:
+              print(urllib.request.urlopen(req, timeout=30).read().decode())
+          except Exception as e:
+              print("status report failed (non-fatal):", e)
+          REPORTEOF
+
+  notify:
+    needs: [build-ios, build-ios-release]
+    if: always() && needs.build-ios.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write email script
+        run: |
+          cat > /tmp/send_email.py << "ENDSCRIPT"
+          import smtplib, os
+          from email.mime.text import MIMEText
+          from email.mime.multipart import MIMEMultipart
+          game_name = os.environ["GAME_NAME"]
+          user_email = os.environ["USER_EMAIL"]
+          appetize_url = os.environ["APPETIZE_URL"]
+          ios_url = os.environ.get("IOS_URL", "")
+          ipa_url = os.environ.get("IPA_URL", "")
+          game_id = os.environ["GAME_ID"]
+          gmail_pass = os.environ["GMAIL_APP_PASSWORD"]
+          html = "<h2>Your iOS build is ready!</h2>"
+          html += "<p><b>" + game_name + "</b> iOS simulator build is ready.</p>"
+          html += "<h3>Live Preview</h3>"
+          html += "<p><b>iOS:</b> <a href='" + appetize_url + "'>" + appetize_url + "</a></p>"
+          if ios_url or ipa_url:
+              html += "<h3>Download</h3>"
+          if ios_url:
+              html += "<p><b>iOS Simulator:</b> <a href='" + ios_url + "'>Download Build</a></p>"
+          if ipa_url:
+              html += "<p><b>iOS Release IPA:</b> <a href='" + ipa_url + "'>Download IPA</a></p>"
+          html += "<hr><p><small>Game ID: " + game_id + "</small></p>"
+          msg = MIMEMultipart("alternative")
+          msg["Subject"] = "iOS Build Ready: " + game_name
+          msg["From"] = "Quiz Game Builder <waqascsme@gmail.com>"
+          msg["To"] = user_email
+          msg.attach(MIMEText(html, "html"))
+          server = smtplib.SMTP("smtp.gmail.com", 587)
+          server.starttls()
+          server.login("waqascsme@gmail.com", gmail_pass)
+          server.sendmail("waqascsme@gmail.com", user_email, msg.as_string())
+          server.quit()
+          print("Email sent to " + user_email)
+          ENDSCRIPT
+
+      - name: Send email via Gmail SMTP
+        env:
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          GAME_NAME: ${{ github.event.inputs.game_name }}
+          USER_EMAIL: ${{ github.event.inputs.user_email }}
+          GAME_ID: ${{ github.event.inputs.game_id }}
+          IOS_KEY: ${{ needs.build-ios.outputs.public_key }}
+          IOS_URL: ${{ needs.build-ios.outputs.ios_url }}
+          IPA_URL: ${{ needs.build-ios-release.outputs.ipa_url }}
+        run: |
+          if [ -z "$USER_EMAIL" ]; then
+            echo "No user email, skipping notification"
+            exit 0
+          fi
+          export APPETIZE_URL="https://appetize.io/app/$IOS_KEY?autoplay=true"
+          if [ -z "$GMAIL_APP_PASSWORD" ]; then
+            echo "No Gmail app password, skipping email"
+            echo "::notice::iOS Preview: $APPETIZE_URL"
+            exit 0
+          fi
+          python3 /tmp/send_email.py
+
+      - name: Print preview links
+        if: always()
+        env:
+          IOS_KEY: ${{ needs.build-ios.outputs.public_key }}
+          IOS_URL: ${{ needs.build-ios.outputs.ios_url }}
+          IPA_URL: ${{ needs.build-ios-release.outputs.ipa_url }}
+        run: |
+          echo "=========================================="
+          echo "  iOS BUILD COMPLETE!"
+          echo "=========================================="
+          echo "iOS Preview: https://appetize.io/app/$IOS_KEY"
+          echo "iOS Download: $IOS_URL"
+          if [ -n "$IPA_URL" ]; then
+            echo "iOS Release IPA: $IPA_URL"
+          fi
+          echo "=========================================="
+          echo "::notice::iOS Preview: https://appetize.io/app/$IOS_KEY"
